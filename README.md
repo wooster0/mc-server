@@ -6,6 +6,7 @@ A -performance Minecraft server supporting versions 1.8.X and, by chance, others
 * [ ] Configurable proper legacy packet handling
 * [ ] Highly configurable
 * [ ] High performance
+* [ ] Support online-mode servers (i.e. encryption)
 
 ## References
 * https://wiki.vg/

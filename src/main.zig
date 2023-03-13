@@ -2,9 +2,11 @@
 // or use JSON simply because MC uses it too and it's well known (in that case still do this; just parse JSON at comptime. @embedFile or read file depending on how the user wants it)
 // so, advanced users can boost the server performance by recompiling the server using *comptime-known config values*. this is a unique possibility offered only really by zig.
 
+// for text, it'd be cool if color can be abstracted to work on the terminal as well as in the game using ampersands and or section signs
+
 const std = @import("std");
 
-// https://wiki.vg/index.php?title=Protocol&oldid=7368
+// https://wiki.vg/Protocol&oldid=7368
 const net = std.net;
 const log = std.log;
 const leb = std.leb;
@@ -81,6 +83,7 @@ const Server = struct {
         fn receivePacket(client: *Client, allocator: mem.Allocator, stream: net.Stream) !enum { keep, terminate } {
             // The meaning of a packet depends both on its packet ID and the current state of the connection.
 
+            // not supporting or handling compression for now
             const stream_reader = stream.reader();
 
             std.debug.print("\n", .{});
@@ -122,7 +125,7 @@ const Server = struct {
 
                             return .keep;
                         },
-                        else => return error.UnexpectedHandshakePacketId,
+                        else => return error.UnexpectedHandshakePacketID,
                     }
                 },
                 .status => {
@@ -134,7 +137,7 @@ const Server = struct {
                             try json.stringify(
                                 Status{
                                     .version = .{ .name = "1.8.9", .protocol = .@"1.8.X" },
-                                    .players = .{ .max = 69, .online = 0, .sample = null },
+                                    .players = .{ .max = 420, .online = 69, .sample = null },
                                     .description = .{ .text = "hi" },
                                     .favicon = null,
                                 },
@@ -142,7 +145,7 @@ const Server = struct {
                                 client.json_buffer.writer(allocator),
                             );
                             defer client.json_buffer.items.len = 0;
-                            try writeString(client.packet_buffer.writer(allocator), client.json_buffer.items);
+                            try writeString(client.packet_buffer.writer(allocator), client.json_buffer.items); // JSON Response
                             try client.sendPacket(stream, 0x00);
 
                             return .keep;
@@ -152,19 +155,41 @@ const Server = struct {
 
                             const payload = try readLong(stream_reader);
                             // Ping Response
-                            try writeLong(client.packet_buffer.writer(allocator), payload);
+                            try writeLong(client.packet_buffer.writer(allocator), payload); // Payload
                             try client.sendPacket(stream, 0x01);
 
                             return .terminate;
                         },
-                        else => return error.UnexpectedStatusPacketId,
+                        else => return error.UnexpectedStatusPacketID,
                     }
                 },
-                .login => unreachable,
+                .login => switch (packet_id) {
+                    0x00 => { // Login Start
+                        var buf: [16]u8 = undefined;
+                        const name = try readString(stream_reader, &buf);
+                        log.info("> {s} wants to join the minecraft server", .{name});
+                        const has_player_uuid = try readBoolean(stream_reader);
+                        if (has_player_uuid) {
+                            const uuid = try readUUID(stream_reader);
+                            log.info("the player's UUID is {X}", .{uuid});
+                        } else {
+                            log.info("client did not sent player's UUID", .{});
+                        }
+
+                        // Login Success (no encryption for now)
+                        try writeUUID(client.packet_buffer.writer(allocator), 0); // UUID
+                        try writeString(client.packet_buffer.writer(allocator), name); // Username
+                        try writeVarInt(client.packet_buffer.writer(allocator), 0); // Number Of Properties
+                        try client.sendPacket(stream, 0x02);
+
+                        return .keep;
+                    },
+                    else => return error.UnexpectedLoginPacketID,
+                },
             }
         }
 
-        /// Sends off all data in `packet_buffer`.
+        /// Sends off all data in `packet_buffer` to the client.
         fn sendPacket(client: *Client, stream: net.Stream, id: i32) !void {
             var id_bytes = std.BoundedArray(u8, 5){};
             try writeVarInt(id_bytes.writer(), id);
@@ -196,6 +221,18 @@ const Server = struct {
     }
 };
 
+//
+// https://wiki.vg/Data_types
+//
+
+fn readBoolean(reader: anytype) !bool {
+    return switch (try reader.readByte()) {
+        0 => false,
+        1 => true,
+        else => error.UnexpectedBooleanValue,
+    };
+}
+
 fn readUnsignedShort(reader: anytype) !u16 {
     return try reader.readIntBig(u16);
 }
@@ -208,7 +245,7 @@ fn writeLong(writer: anytype, value: i64) !void {
 }
 
 fn readString(reader: anytype, buf: []u8) ![]const u8 {
-    const len: u15 = @intCast(u15, try readVarInt(reader));
+    const len: u15 = math.cast(u15, try readVarInt(reader)) orelse return error.StringTooBig; // Maximum length is 32767.
     if (len < 0) return error.Underflow;
     for (0..len) |i| {
         buf[i] = try reader.readByte();
@@ -267,6 +304,13 @@ fn writeVarLong(writer: anytype, value: i64) !void {
         try writer.writeByte(@intCast(u8, (value_unsigned & segment_bits) | continue_bit));
         value_unsigned >>= 7;
     }
+}
+
+fn readUUID(reader: anytype) !u128 {
+    return try reader.readIntBig(u128);
+}
+fn writeUUID(writer: anytype, value: u128) !void {
+    try writer.writeIntBig(u128, value);
 }
 
 fn testReadVarInt(bytes: []const u8, expected: i32) !void {
