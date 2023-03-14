@@ -6,7 +6,6 @@
 
 const std = @import("std");
 
-// https://wiki.vg/Protocol&oldid=7368
 const net = std.net;
 const log = std.log;
 const leb = std.leb;
@@ -20,8 +19,12 @@ const mem = std.mem;
 const io = std.io;
 
 /// https://wiki.vg/Protocol_version_numbers
-const ProtocolVersion = enum(u16) {
-    @"1.8.X" = 47,
+const ProtocolVersion = enum(i32) {
+    /// https://wiki.vg/Protocol&oldid=7368
+    @"1.8" = 47,
+
+    /// https://wiki.vg/Protocol
+    _,
 
     pub fn jsonStringify(
         value: ProtocolVersion,
@@ -39,7 +42,6 @@ const Status = struct {
     players: struct { max: u32, online: u32, sample: ?[]const struct { name: []const u8, id: []const u8 } },
     description: struct { text: []const u8 },
     favicon: ?[]const u8,
-    //enforcesSecureChat: bool,
 };
 
 pub fn main() !void {
@@ -48,25 +50,37 @@ pub fn main() !void {
     try server.run(allocator.allocator());
 }
 
+threadlocal var json_buffer = std.BoundedArray(u8, 2048){};
+
+fn JSONStringify(writer: anytype, value: anytype) !void {
+    try json.stringify(
+        value,
+        .{ .whitespace = null, .emit_null_optional_fields = false, .string = .{ .String = .{} } },
+        writer,
+    );
+}
+
 const Server = struct {
     const Client = struct {
         stream: net.Stream,
         state: State = .handshake,
-        json_buffer: std.ArrayListUnmanaged(u8) = .{},
         packet_buffer: std.ArrayListUnmanaged(u8) = .{},
+        protocol_version: ProtocolVersion = undefined,
 
         const State = enum(u2) {
             /// https://wiki.vg/Protocol#Handshake
-            handshake = 0,
+            handshake,
             /// https://wiki.vg/Protocol_FAQ#What_does_the_normal_status_ping_sequence_look_like.3F
             status = 1,
-            /// https://wiki.vg/Protocol_FAQ#What.27s_the_normal_login_sequence_for_a_client.3F
+            /// 1.8: https://wiki.vg/index.php?title=Protocol_FAQ&oldid=8231#What.27s_the_normal_login_sequence_for_a_client.3F
+            /// Other: https://wiki.vg/Protocol_FAQ#What.27s_the_normal_login_sequence_for_a_client.3F
             login = 2,
+            play,
         };
 
         fn handle(client: *Client, allocator: mem.Allocator) void {
             while (true) {
-                const status = client.receivePacket(allocator, client.stream) catch |err| {
+                const status = client.receivePacket(allocator) catch |err| {
                     log.err("handling packet: {}", .{err});
                     break;
                 };
@@ -80,11 +94,12 @@ const Server = struct {
             }
         }
 
-        fn receivePacket(client: *Client, allocator: mem.Allocator, stream: net.Stream) !enum { keep, terminate } {
+        fn receivePacket(client: *Client, allocator: mem.Allocator) !enum { keep, terminate } {
             // The meaning of a packet depends both on its packet ID and the current state of the connection.
 
             // not supporting or handling compression for now
-            const stream_reader = stream.reader();
+            const stream_reader = client.stream.reader();
+            const packet_writer = client.packet_buffer.writer(allocator);
 
             std.debug.print("\n", .{});
             log.debug("receiving packet...", .{});
@@ -108,7 +123,8 @@ const Server = struct {
                         0x00 => { // Handshake
                             log.info("handling Handshake", .{});
 
-                            const protocol_version = try readVarInt(stream_reader);
+                            const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(stream_reader));
+                            client.protocol_version = protocol_version;
                             log.debug("protocol_version: {}", .{protocol_version});
 
                             var buf: [255]u8 = undefined;
@@ -134,29 +150,28 @@ const Server = struct {
                             log.info("handling Status Request", .{});
 
                             // Status Response
-                            try json.stringify(
+                            try JSONStringify(
+                                json_buffer.writer(),
                                 Status{
-                                    .version = .{ .name = "1.8.9", .protocol = .@"1.8.X" },
+                                    .version = .{ .name = "1.8", .protocol = .@"1.8" },
                                     .players = .{ .max = 420, .online = 69, .sample = null },
-                                    .description = .{ .text = "hi" },
+                                    .description = .{ .text = "hi §4wow this is red" },
                                     .favicon = null,
                                 },
-                                .{ .whitespace = null, .emit_null_optional_fields = false, .string = .{ .String = .{} } },
-                                client.json_buffer.writer(allocator),
                             );
-                            defer client.json_buffer.items.len = 0;
-                            try writeString(client.packet_buffer.writer(allocator), client.json_buffer.items); // JSON Response
-                            try client.sendPacket(stream, 0x00);
+                            defer json_buffer.len = 0;
+                            try writeString(packet_writer, json_buffer.constSlice()); // JSON Response
+                            try client.sendPacket(0x00);
 
                             return .keep;
                         },
                         0x01 => { // Ping Request
                             log.info("handling Ping Request", .{});
 
-                            const payload = try readLong(stream_reader);
                             // Ping Response
-                            try writeLong(client.packet_buffer.writer(allocator), payload); // Payload
-                            try client.sendPacket(stream, 0x01);
+                            const payload = try readLong(stream_reader);
+                            try writeLong(packet_writer, payload); // Payload
+                            try client.sendPacket(0x01);
 
                             return .terminate;
                         },
@@ -165,38 +180,74 @@ const Server = struct {
                 },
                 .login => switch (packet_id) {
                     0x00 => { // Login Start
-                        var buf: [16]u8 = undefined;
-                        const name = try readString(stream_reader, &buf);
-                        log.info("> {s} wants to join the minecraft server", .{name});
-                        const has_player_uuid = try readBoolean(stream_reader);
-                        if (has_player_uuid) {
-                            const uuid = try readUUID(stream_reader);
-                            log.info("the player's UUID is {X}", .{uuid});
+                        log.info("handling Login Start", .{});
+
+                        if (client.protocol_version != .@"1.8") {
+                            // Disconnect
+                            try writeChat(packet_writer, .{ .text = "Please use 1.8.X to join the Minecraft server." }); // Reason
+                            try client.sendPacket(0x00);
+
+                            return .terminate;
                         } else {
-                            log.info("client did not sent player's UUID", .{});
+                            var buf: [16]u8 = undefined;
+                            const name = try readString(stream_reader, &buf);
+                            log.info("> {s} wants to join the minecraft server", .{name});
+                            const has_player_uuid = try readBoolean(stream_reader);
+                            if (has_player_uuid) {
+                                const uuid = try readUUID(stream_reader);
+                                log.info("the player's UUID is {X}", .{uuid});
+                            } else {
+                                log.info("client did not sent player's UUID", .{});
+                            }
+
+                            // Login Success (no encryption/authentication for now)
+                            try writeUUID(packet_writer, 0); // UUID
+                            try writeString(packet_writer, name); // Username
+                            try writeVarInt(packet_writer, 0); // Number Of Properties
+                            try client.sendPacket(0x02);
+
+                            client.state = .play;
+
+                            // Join Game
+                            try writeInt(packet_writer, 1337); // Entity ID
+                            try writeUnsignedByte(packet_writer, 0); // Gamemode
+                            try writeByte(packet_writer, 0); // Dimension
+                            try writeUnsignedByte(packet_writer, 2); // Difficulty
+                            try writeUnsignedByte(packet_writer, 0); // Max Players (can't be more than 255? what's up with that? clamp to 255?)
+                            try writeString(packet_writer, "default"); // Level Type
+                            try writeBoolean(packet_writer, false); // Reduced Debug Info
+                            try client.sendPacket(0x01);
+
+                            // Spawn Position
+                            try writePosition(packet_writer, .{ .x = 0, .y = 0, .z = 0 }); // Location
+                            try client.sendPacket(0x05);
+
+                            // Player Abilities
+                            try writeByte(packet_writer, 0x01); // Flags ("Invulnerable")
+                            try writeFloat(packet_writer, 0); // Flying Speed
+                            try writeFloat(packet_writer, 10); // Field of View Modifier
+                            try client.sendPacket(0x39);
+
+                            return .keep;
                         }
-
-                        // Login Success (no encryption for now)
-                        try writeUUID(client.packet_buffer.writer(allocator), 0); // UUID
-                        try writeString(client.packet_buffer.writer(allocator), name); // Username
-                        try writeVarInt(client.packet_buffer.writer(allocator), 0); // Number Of Properties
-                        try client.sendPacket(stream, 0x02);
-
-                        return .keep;
                     },
                     else => return error.UnexpectedLoginPacketID,
+                },
+                .play => {
+                    if (true) unreachable;
+                    return .keep;
                 },
             }
         }
 
         /// Sends off all data in `packet_buffer` to the client.
-        fn sendPacket(client: *Client, stream: net.Stream, id: i32) !void {
+        fn sendPacket(client: *Client, id: i32) !void {
             var id_bytes = std.BoundedArray(u8, 5){};
             try writeVarInt(id_bytes.writer(), id);
-            const stream_writer = stream.writer();
+            const stream_writer = client.stream.writer();
             try writeVarInt(stream_writer, @intCast(i32, id_bytes.len + client.packet_buffer.items.len)); // Length of Packet ID + Data
             try stream_writer.writeAll(id_bytes.constSlice()); // Packet ID
-            try stream_writer.writeAll(client.packet_buffer.items); // Data
+            try stream_writer.writeAll(client.packet_buffer.items); // Data (they call this a Byte Array)
             client.packet_buffer.items.len = 0;
         }
     };
@@ -205,11 +256,16 @@ const Server = struct {
         _ = server;
         var tcp_server = net.StreamServer.init(.{ .reuse_address = true });
         defer tcp_server.deinit();
-        const address = net.Address.initIp4(.{ 127, 0, 0, 1 }, 25555);
+        const address = net.Address.initIp4(
+            .{ 127, 0, 0, 1 },
+            // see "Minecraft (Java Edition) multiplayer server" on https://en.wikipedia.org/wiki/List_of_TCP_and_UDP_port_numbers
+            25565,
+            // this port should later only be used as a fallback/default. it allows the user to access the server with just "localhost" in the game
+        );
         try tcp_server.listen(address);
-        log.info("listening on localhost:25555", .{});
+        log.info("listening on {}", .{address});
         while (true) {
-            // accept is thread-safe and accepting clients can be parallelized
+            // `accept` is thread-safe and accepting clients can be parallelized
             const connection = tcp_server.accept() catch |err| {
                 log.err("accepting connection: {}", .{err});
                 continue;
@@ -222,7 +278,8 @@ const Server = struct {
 };
 
 //
-// https://wiki.vg/Data_types
+// 1.8: https://wiki.vg/index.php?title=Data_types&oldid=7250
+// Other: https://wiki.vg/Data_types
 //
 
 fn readBoolean(reader: anytype) !bool {
@@ -232,9 +289,24 @@ fn readBoolean(reader: anytype) !bool {
         else => error.UnexpectedBooleanValue,
     };
 }
+fn writeBoolean(writer: anytype, value: bool) !void {
+    try writer.writeByte(@boolToInt(value));
+}
+
+fn writeByte(writer: anytype, value: i8) !void {
+    try writer.writeByte(@bitCast(u8, value));
+}
+
+fn writeUnsignedByte(writer: anytype, value: u8) !void {
+    try writer.writeByte(value);
+}
 
 fn readUnsignedShort(reader: anytype) !u16 {
     return try reader.readIntBig(u16);
+}
+
+fn writeInt(writer: anytype, value: i32) !void {
+    try writer.writeIntBig(i32, value);
 }
 
 fn readLong(reader: anytype) !i64 {
@@ -242,6 +314,14 @@ fn readLong(reader: anytype) !i64 {
 }
 fn writeLong(writer: anytype, value: i64) !void {
     try writer.writeIntBig(i64, value);
+}
+
+fn writeFloat(writer: anytype, value: f32) !void {
+    try writer.writeIntBig(u32, @bitCast(u32, value));
+}
+
+fn writeDouble(writer: anytype, value: f64) !void {
+    try writer.writeIntBig(u64, @bitCast(u64, value));
 }
 
 fn readString(reader: anytype, buf: []u8) ![]const u8 {
@@ -255,6 +335,16 @@ fn readString(reader: anytype, buf: []u8) ![]const u8 {
 fn writeString(writer: anytype, buf: []const u8) !void {
     try writeVarInt(writer, @intCast(u15, buf.len)); // Maximum length is 32767.
     try writer.writeAll(buf);
+}
+
+const Chat = struct {
+    text: []const u8,
+};
+
+fn writeChat(writer: anytype, chat: Chat) !void {
+    try JSONStringify(json_buffer.writer(), chat);
+    defer json_buffer.len = 0;
+    try writeString(writer, json_buffer.constSlice()); // JSON Response
 }
 
 const segment_bits = 0x7F;
@@ -304,6 +394,16 @@ fn writeVarLong(writer: anytype, value: i64) !void {
         try writer.writeByte(@intCast(u8, (value_unsigned & segment_bits) | continue_bit));
         value_unsigned >>= 7;
     }
+}
+
+const Position = packed struct(u64) {
+    x: i26,
+    y: i12,
+    z: i26,
+};
+
+fn writePosition(writer: anytype, position: Position) !void {
+    try writer.writeStruct(position);
 }
 
 fn readUUID(reader: anytype) !u128 {
