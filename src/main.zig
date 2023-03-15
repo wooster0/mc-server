@@ -149,13 +149,15 @@ const Server = struct {
                         0x00 => { // Status Request
                             log.info("handling Status Request", .{});
 
+                            const section_sign = "§";
+
                             // Status Response
                             try JSONStringify(
                                 json_buffer.writer(),
                                 Status{
                                     .version = .{ .name = "1.8", .protocol = .@"1.8" },
                                     .players = .{ .max = 420, .online = 69, .sample = null },
-                                    .description = .{ .text = "hi §4wow this is red" },
+                                    .description = .{ .text = std.fmt.comptimePrint("hi {s}4wow this is red", .{section_sign}) },
                                     .favicon = null,
                                 },
                             );
@@ -182,6 +184,10 @@ const Server = struct {
                     0x00 => { // Login Start
                         log.info("handling Login Start", .{});
 
+                        var buf: [16]u8 = undefined;
+                        const name = try readString(stream_reader, &buf);
+                        log.info("> {s} wants to join the minecraft server", .{name});
+
                         if (client.protocol_version != .@"1.8") {
                             // Disconnect
                             try writeChat(packet_writer, .{ .text = "Please use 1.8.X to join the Minecraft server." }); // Reason
@@ -189,21 +195,9 @@ const Server = struct {
 
                             return .terminate;
                         } else {
-                            var buf: [16]u8 = undefined;
-                            const name = try readString(stream_reader, &buf);
-                            log.info("> {s} wants to join the minecraft server", .{name});
-                            const has_player_uuid = try readBoolean(stream_reader);
-                            if (has_player_uuid) {
-                                const uuid = try readUUID(stream_reader);
-                                log.info("the player's UUID is {X}", .{uuid});
-                            } else {
-                                log.info("client did not sent player's UUID", .{});
-                            }
-
                             // Login Success (no encryption/authentication for now)
-                            try writeUUID(packet_writer, 0); // UUID
+                            try writeString(packet_writer, "00000000-0000-0000-0000-000000000000"); // UUID (not sure what I'm supposed to pass here; are we supposed to make this up?)
                             try writeString(packet_writer, name); // Username
-                            try writeVarInt(packet_writer, 0); // Number Of Properties
                             try client.sendPacket(0x02);
 
                             client.state = .play;
@@ -213,7 +207,7 @@ const Server = struct {
                             try writeUnsignedByte(packet_writer, 0); // Gamemode
                             try writeByte(packet_writer, 0); // Dimension
                             try writeUnsignedByte(packet_writer, 2); // Difficulty
-                            try writeUnsignedByte(packet_writer, 0); // Max Players (can't be more than 255? what's up with that? clamp to 255?)
+                            try writeUnsignedByte(packet_writer, 2); // Max Players (can't be more than 255? what's up with that? clamp to 255?)
                             try writeString(packet_writer, "default"); // Level Type
                             try writeBoolean(packet_writer, false); // Reduced Debug Info
                             try client.sendPacket(0x01);
@@ -223,10 +217,19 @@ const Server = struct {
                             try client.sendPacket(0x05);
 
                             // Player Abilities
-                            try writeByte(packet_writer, 0x01); // Flags ("Invulnerable")
+                            try writeByte(packet_writer, 0b0000_0000); // Flags
                             try writeFloat(packet_writer, 0); // Flying Speed
                             try writeFloat(packet_writer, 10); // Field of View Modifier
                             try client.sendPacket(0x39);
+
+                            // Player Position And Look
+                            try writeDouble(packet_writer, 0); // X
+                            try writeDouble(packet_writer, 0); // Y
+                            try writeDouble(packet_writer, 0); // Z
+                            try writeFloat(packet_writer, 0); // Yaw
+                            try writeFloat(packet_writer, 0); // Pitch
+                            try writeByte(packet_writer, 0b0000_0000); // Flags
+                            try client.sendPacket(0x08);
 
                             return .keep;
                         }
