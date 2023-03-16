@@ -98,24 +98,24 @@ const Server = struct {
             // The meaning of a packet depends both on its packet ID and the current state of the connection.
 
             // not supporting or handling compression for now
-            const stream_reader = client.stream.reader();
+            const packet_reader = client.stream.reader();
             const packet_writer = client.packet_buffer.writer(allocator);
 
             std.debug.print("\n", .{});
             log.debug("receiving packet...", .{});
-            const length = try readVarInt(stream_reader);
+            const length = try readVarInt(packet_reader); // Length
             if (length == 0xfe) { // Legacy Server List Ping
                 // Only clients before 1.7.0 send this.
                 log.info("legacy packet received", .{});
-                log.info("{s}", .{try stream_reader.readBytesNoEof(100)});
+                log.info("{s}", .{try packet_reader.readBytesNoEof(100)});
                 return .terminate;
             }
             log.debug("length: {}", .{length});
             // Packets cannot be larger than 2097151 bytes (the maximum that can be sent in a 3-byte VarInt).
             if (length > std.math.maxInt(u21)) return error.PacketTooBig;
 
-            const packet_id = try readVarInt(stream_reader);
-            log.debug("packet_id: {}", .{packet_id});
+            const packet_id = try readVarInt(packet_reader); // Packet ID
+            log.debug("Packet ID: 0x{X}", .{packet_id});
 
             switch (client.state) {
                 .handshake => {
@@ -123,19 +123,19 @@ const Server = struct {
                         0x00 => { // Handshake
                             log.info("handling Handshake", .{});
 
-                            const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(stream_reader));
+                            const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(packet_reader)); // Protocol Version
                             client.protocol_version = protocol_version;
                             log.debug("protocol_version: {}", .{protocol_version});
 
                             var buf: [255]u8 = undefined;
-                            const server_address = try readString(stream_reader, &buf);
+                            const server_address = try readString(packet_reader, &buf); // Server Address
                             log.debug("server_address: {s}", .{server_address});
                             if (mem.endsWith(u8, server_address, "FML\x00")) log.debug("Forge Mod Loader in use", .{});
 
-                            const server_port = try readUnsignedShort(stream_reader);
+                            const server_port = try readUnsignedShort(packet_reader); // Server Port
                             log.debug("server_port: {}", .{server_port});
 
-                            const next_state = try meta.intToEnum(State, try readVarInt(stream_reader));
+                            const next_state = try meta.intToEnum(State, try readVarInt(packet_reader)); // Next State
                             log.debug("next_state: {}", .{next_state});
                             client.state = next_state;
 
@@ -171,7 +171,7 @@ const Server = struct {
                             log.info("handling Ping Request", .{});
 
                             // Ping Response
-                            const payload = try readLong(stream_reader);
+                            const payload = try readLong(packet_reader); // Payload
                             try writeLong(packet_writer, payload); // Payload
                             try client.sendPacket(0x01);
 
@@ -185,7 +185,7 @@ const Server = struct {
                         log.info("handling Login Start", .{});
 
                         var buf: [16]u8 = undefined;
-                        const name = try readString(stream_reader, &buf);
+                        const name = try readString(packet_reader, &buf); // Name
                         log.info("> {s} wants to join the minecraft server", .{name});
 
                         if (client.protocol_version != .@"1.8") {
@@ -237,8 +237,41 @@ const Server = struct {
                     else => return error.UnexpectedLoginPacketID,
                 },
                 .play => {
-                    if (true) unreachable;
-                    return .keep;
+                    switch (packet_id) {
+                        0x15 => { // Client Settings
+                            var buf: [16]u8 = undefined;
+                            const locale = try readString(packet_reader, &buf); // Locale
+                            log.info("player uses this language for their client: {s}", .{locale});
+                            const view_distance = try readByte(packet_reader); // View Distance
+                            log.info("this is their view distance: {}", .{view_distance});
+                            const chat_mode = try readByte(packet_reader); // Chat Mode
+                            log.info("Chat Mode: {}", .{chat_mode});
+                            const chat_colors = try readBoolean(packet_reader); // Chat Colors
+                            log.info("can the person see colors in chat? {}", .{chat_colors});
+                            const displayed_skin_parts = try readUnsignedByte(packet_reader); // Displayed Skin Parts
+                            log.info("displayed_skin_parts: {}", .{displayed_skin_parts});
+
+                            return .keep;
+                        },
+                        0x17 => { // Plugin Message
+                            var buf: [1024]u8 = undefined; // not sure about this buf size
+                            var counting_packet_reader = io.countingReader(packet_reader);
+                            const channel = try readString(counting_packet_reader.reader(), &buf); // Channel
+                            log.info("Plugin Message channel: {s}", .{channel});
+                            log.warn("ignoring Plugin Message content. also see length above", .{});
+                            // we still need to look at all bytes of this Byte Array before we can continue.
+                            // this is not very elegant.
+                            var packet_id_bytes = std.BoundedArray(u8, 5){};
+                            try writeVarInt(packet_id_bytes.writer(), packet_id);
+                            try packet_reader.skipBytes(
+                                ((math.cast(u64, length) orelse return error.NegativePacketLength) - counting_packet_reader.bytes_read - packet_id_bytes.len),
+                                .{},
+                            ); // Data
+
+                            return .keep;
+                        },
+                        else => return error.UnexpectedPlayPacketID,
+                    }
                 },
             }
         }
@@ -296,10 +329,17 @@ fn writeBoolean(writer: anytype, value: bool) !void {
     try writer.writeByte(@boolToInt(value));
 }
 
+// there is readByteSigned in the std but not writeByteSigned...
+fn readByte(reader: anytype) !i8 {
+    return @bitCast(i8, try reader.readByte());
+}
 fn writeByte(writer: anytype, value: i8) !void {
     try writer.writeByte(@bitCast(u8, value));
 }
 
+fn readUnsignedByte(reader: anytype) !u8 {
+    return try reader.readByte();
+}
 fn writeUnsignedByte(writer: anytype, value: u8) !void {
     try writer.writeByte(value);
 }
@@ -328,8 +368,8 @@ fn writeDouble(writer: anytype, value: f64) !void {
 }
 
 fn readString(reader: anytype, buf: []u8) ![]const u8 {
+    // would be nice if math cast returned error.Underflow and error.Overflow
     const len: u15 = math.cast(u15, try readVarInt(reader)) orelse return error.StringTooBig; // Maximum length is 32767.
-    if (len < 0) return error.Underflow;
     for (0..len) |i| {
         buf[i] = try reader.readByte();
     }
