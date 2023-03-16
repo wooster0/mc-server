@@ -78,6 +78,8 @@ const Server = struct {
             play,
         };
 
+        const KeepOrTerminate = enum { keep, terminate };
+
         fn handle(client: *Client, allocator: mem.Allocator) void {
             while (true) {
                 const status = client.receivePacket(allocator) catch |err| {
@@ -94,12 +96,11 @@ const Server = struct {
             }
         }
 
-        fn receivePacket(client: *Client, allocator: mem.Allocator) !enum { keep, terminate } {
+        fn receivePacket(client: *Client, allocator: mem.Allocator) !KeepOrTerminate {
             // The meaning of a packet depends both on its packet ID and the current state of the connection.
 
             // not supporting or handling compression for now
             const packet_reader = client.stream.reader();
-            const packet_writer = client.packet_buffer.writer(allocator);
 
             std.debug.print("\n", .{});
             log.debug("receiving packet...", .{});
@@ -118,161 +119,179 @@ const Server = struct {
             log.debug("Packet ID: 0x{X}", .{packet_id});
 
             switch (client.state) {
-                .handshake => {
-                    switch (packet_id) {
-                        0x00 => { // Handshake
-                            log.info("handling Handshake", .{});
+                .play => return client.handlePlay(allocator, packet_id, length),
+                .login => return client.handleLogin(allocator, packet_id),
+                .status => return client.handleStatus(allocator, packet_id),
+                .handshake => return client.handleHandshake(packet_id),
+            }
+        }
 
-                            const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(packet_reader)); // Protocol Version
-                            client.protocol_version = protocol_version;
-                            log.debug("protocol_version: {}", .{protocol_version});
+        fn handleHandshake(client: *Client, packet_id: i32) !KeepOrTerminate {
+            const packet_reader = client.stream.reader();
+            switch (packet_id) {
+                0x00 => { // Handshake
+                    log.info("handling Handshake", .{});
 
-                            var buf: [255]u8 = undefined;
-                            const server_address = try readString(packet_reader, &buf); // Server Address
-                            log.debug("server_address: {s}", .{server_address});
-                            if (mem.endsWith(u8, server_address, "FML\x00")) log.debug("Forge Mod Loader in use", .{});
+                    const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(packet_reader)); // Protocol Version
+                    client.protocol_version = protocol_version;
+                    log.debug("protocol_version: {}", .{protocol_version});
 
-                            const server_port = try readUnsignedShort(packet_reader); // Server Port
-                            log.debug("server_port: {}", .{server_port});
+                    var buf: [255]u8 = undefined;
+                    const server_address = try readString(packet_reader, &buf); // Server Address
+                    log.debug("server_address: {s}", .{server_address});
+                    if (mem.endsWith(u8, server_address, "FML\x00")) log.debug("Forge Mod Loader in use", .{});
 
-                            const next_state = try meta.intToEnum(State, try readVarInt(packet_reader)); // Next State
-                            log.debug("next_state: {}", .{next_state});
-                            client.state = next_state;
+                    const server_port = try readUnsignedShort(packet_reader); // Server Port
+                    log.debug("server_port: {}", .{server_port});
 
-                            return .keep;
+                    const next_state = try meta.intToEnum(State, try readVarInt(packet_reader)); // Next State
+                    log.debug("next_state: {}", .{next_state});
+                    client.state = next_state;
+
+                    return .keep;
+                },
+                else => return error.UnexpectedHandshakePacketID,
+            }
+        }
+
+        fn handleStatus(client: *Client, allocator: mem.Allocator, packet_id: i32) !KeepOrTerminate {
+            const packet_reader = client.stream.reader();
+            const packet_writer = client.packet_buffer.writer(allocator);
+            switch (packet_id) {
+                0x00 => { // Status Request
+                    log.info("handling Status Request", .{});
+
+                    const section_sign = "§";
+
+                    // Status Response
+                    try JSONStringify(
+                        json_buffer.writer(),
+                        Status{
+                            .version = .{ .name = "1.8", .protocol = .@"1.8" },
+                            .players = .{ .max = 420, .online = 69, .sample = null },
+                            .description = .{ .text = std.fmt.comptimePrint("hi {s}4wow this is red", .{section_sign}) },
+                            .favicon = null,
                         },
-                        else => return error.UnexpectedHandshakePacketID,
+                    );
+                    defer json_buffer.len = 0;
+                    try writeString(packet_writer, json_buffer.constSlice()); // JSON Response
+                    try client.sendPacket(0x00);
+
+                    return .keep;
+                },
+                0x01 => { // Ping Request
+                    log.info("handling Ping Request", .{});
+
+                    // Ping Response
+                    const payload = try readLong(packet_reader); // Payload
+                    try writeLong(packet_writer, payload); // Payload
+                    try client.sendPacket(0x01);
+
+                    return .terminate;
+                },
+                else => return error.UnexpectedStatusPacketID,
+            }
+        }
+
+        fn handleLogin(client: *Client, allocator: mem.Allocator, packet_id: i32) !KeepOrTerminate {
+            const packet_reader = client.stream.reader();
+            const packet_writer = client.packet_buffer.writer(allocator);
+            switch (packet_id) {
+                0x00 => { // Login Start
+                    log.info("handling Login Start", .{});
+
+                    var buf: [16]u8 = undefined;
+                    const name = try readString(packet_reader, &buf); // Name
+                    log.info("> {s} wants to join the minecraft server", .{name});
+
+                    if (client.protocol_version != .@"1.8") {
+                        // Disconnect
+                        try writeChat(packet_writer, .{ .text = "Please use 1.8.X to join the Minecraft server." }); // Reason
+                        try client.sendPacket(0x00);
+
+                        return .terminate;
+                    } else {
+                        // Login Success (no encryption/authentication for now)
+                        try writeString(packet_writer, "00000000-0000-0000-0000-000000000000"); // UUID (not sure what I'm supposed to pass here; are we supposed to make this up?)
+                        try writeString(packet_writer, name); // Username
+                        try client.sendPacket(0x02);
+
+                        client.state = .play;
+
+                        // Join Game
+                        try writeInt(packet_writer, 1337); // Entity ID
+                        try writeUnsignedByte(packet_writer, 0); // Gamemode
+                        try writeByte(packet_writer, 0); // Dimension
+                        try writeUnsignedByte(packet_writer, 2); // Difficulty
+                        try writeUnsignedByte(packet_writer, 2); // Max Players (can't be more than 255? what's up with that? clamp to 255?)
+                        try writeString(packet_writer, "default"); // Level Type
+                        try writeBoolean(packet_writer, false); // Reduced Debug Info
+                        try client.sendPacket(0x01);
+
+                        // Spawn Position
+                        try writePosition(packet_writer, .{ .x = 0, .y = 0, .z = 0 }); // Location
+                        try client.sendPacket(0x05);
+
+                        // Player Abilities
+                        try writeByte(packet_writer, 0b0000_0000); // Flags
+                        try writeFloat(packet_writer, 0); // Flying Speed
+                        try writeFloat(packet_writer, 10); // Field of View Modifier
+                        try client.sendPacket(0x39);
+
+                        // Player Position And Look
+                        try writeDouble(packet_writer, 0); // X
+                        try writeDouble(packet_writer, 0); // Y
+                        try writeDouble(packet_writer, 0); // Z
+                        try writeFloat(packet_writer, 0); // Yaw
+                        try writeFloat(packet_writer, 0); // Pitch
+                        try writeByte(packet_writer, 0b0000_0000); // Flags
+                        try client.sendPacket(0x08);
+
+                        return .keep;
                     }
                 },
-                .status => {
-                    switch (packet_id) {
-                        0x00 => { // Status Request
-                            log.info("handling Status Request", .{});
+                else => return error.UnexpectedLoginPacketID,
+            }
+        }
 
-                            const section_sign = "§";
+        fn handlePlay(client: *Client, allocator: mem.Allocator, packet_id: i32, packet_length: i32) !KeepOrTerminate {
+            const packet_reader = client.stream.reader();
+            const packet_writer = client.packet_buffer.writer(allocator);
+            _ = packet_writer;
+            switch (packet_id) {
+                0x15 => { // Client Settings
+                    var buf: [16]u8 = undefined;
+                    const locale = try readString(packet_reader, &buf); // Locale
+                    log.info("player uses this language for their client: {s}", .{locale});
+                    const view_distance = try readByte(packet_reader); // View Distance
+                    log.info("this is their view distance: {}", .{view_distance});
+                    const chat_mode = try readByte(packet_reader); // Chat Mode
+                    log.info("Chat Mode: {}", .{chat_mode});
+                    const chat_colors = try readBoolean(packet_reader); // Chat Colors
+                    log.info("can the person see colors in chat? {}", .{chat_colors});
+                    const displayed_skin_parts = try readUnsignedByte(packet_reader); // Displayed Skin Parts
+                    log.info("displayed_skin_parts: {}", .{displayed_skin_parts});
 
-                            // Status Response
-                            try JSONStringify(
-                                json_buffer.writer(),
-                                Status{
-                                    .version = .{ .name = "1.8", .protocol = .@"1.8" },
-                                    .players = .{ .max = 420, .online = 69, .sample = null },
-                                    .description = .{ .text = std.fmt.comptimePrint("hi {s}4wow this is red", .{section_sign}) },
-                                    .favicon = null,
-                                },
-                            );
-                            defer json_buffer.len = 0;
-                            try writeString(packet_writer, json_buffer.constSlice()); // JSON Response
-                            try client.sendPacket(0x00);
-
-                            return .keep;
-                        },
-                        0x01 => { // Ping Request
-                            log.info("handling Ping Request", .{});
-
-                            // Ping Response
-                            const payload = try readLong(packet_reader); // Payload
-                            try writeLong(packet_writer, payload); // Payload
-                            try client.sendPacket(0x01);
-
-                            return .terminate;
-                        },
-                        else => return error.UnexpectedStatusPacketID,
-                    }
+                    return .keep;
                 },
-                .login => switch (packet_id) {
-                    0x00 => { // Login Start
-                        log.info("handling Login Start", .{});
+                0x17 => { // Plugin Message
+                    var buf: [1024]u8 = undefined; // not sure about this buf size
+                    var counting_packet_reader = io.countingReader(packet_reader);
+                    const channel = try readString(counting_packet_reader.reader(), &buf); // Channel
+                    log.info("Plugin Message channel: {s}", .{channel});
+                    log.warn("ignoring Plugin Message content. also see length above", .{});
+                    // we still need to look at all bytes of this Byte Array before we can continue.
+                    // this is not very elegant.
+                    var packet_id_bytes = std.BoundedArray(u8, 5){};
+                    try writeVarInt(packet_id_bytes.writer(), packet_id);
+                    try packet_reader.skipBytes(
+                        ((math.cast(u64, packet_length) orelse return error.NegativePacketLength) - counting_packet_reader.bytes_read - packet_id_bytes.len),
+                        .{},
+                    ); // Data
 
-                        var buf: [16]u8 = undefined;
-                        const name = try readString(packet_reader, &buf); // Name
-                        log.info("> {s} wants to join the minecraft server", .{name});
-
-                        if (client.protocol_version != .@"1.8") {
-                            // Disconnect
-                            try writeChat(packet_writer, .{ .text = "Please use 1.8.X to join the Minecraft server." }); // Reason
-                            try client.sendPacket(0x00);
-
-                            return .terminate;
-                        } else {
-                            // Login Success (no encryption/authentication for now)
-                            try writeString(packet_writer, "00000000-0000-0000-0000-000000000000"); // UUID (not sure what I'm supposed to pass here; are we supposed to make this up?)
-                            try writeString(packet_writer, name); // Username
-                            try client.sendPacket(0x02);
-
-                            client.state = .play;
-
-                            // Join Game
-                            try writeInt(packet_writer, 1337); // Entity ID
-                            try writeUnsignedByte(packet_writer, 0); // Gamemode
-                            try writeByte(packet_writer, 0); // Dimension
-                            try writeUnsignedByte(packet_writer, 2); // Difficulty
-                            try writeUnsignedByte(packet_writer, 2); // Max Players (can't be more than 255? what's up with that? clamp to 255?)
-                            try writeString(packet_writer, "default"); // Level Type
-                            try writeBoolean(packet_writer, false); // Reduced Debug Info
-                            try client.sendPacket(0x01);
-
-                            // Spawn Position
-                            try writePosition(packet_writer, .{ .x = 0, .y = 0, .z = 0 }); // Location
-                            try client.sendPacket(0x05);
-
-                            // Player Abilities
-                            try writeByte(packet_writer, 0b0000_0000); // Flags
-                            try writeFloat(packet_writer, 0); // Flying Speed
-                            try writeFloat(packet_writer, 10); // Field of View Modifier
-                            try client.sendPacket(0x39);
-
-                            // Player Position And Look
-                            try writeDouble(packet_writer, 0); // X
-                            try writeDouble(packet_writer, 0); // Y
-                            try writeDouble(packet_writer, 0); // Z
-                            try writeFloat(packet_writer, 0); // Yaw
-                            try writeFloat(packet_writer, 0); // Pitch
-                            try writeByte(packet_writer, 0b0000_0000); // Flags
-                            try client.sendPacket(0x08);
-
-                            return .keep;
-                        }
-                    },
-                    else => return error.UnexpectedLoginPacketID,
+                    return .keep;
                 },
-                .play => {
-                    switch (packet_id) {
-                        0x15 => { // Client Settings
-                            var buf: [16]u8 = undefined;
-                            const locale = try readString(packet_reader, &buf); // Locale
-                            log.info("player uses this language for their client: {s}", .{locale});
-                            const view_distance = try readByte(packet_reader); // View Distance
-                            log.info("this is their view distance: {}", .{view_distance});
-                            const chat_mode = try readByte(packet_reader); // Chat Mode
-                            log.info("Chat Mode: {}", .{chat_mode});
-                            const chat_colors = try readBoolean(packet_reader); // Chat Colors
-                            log.info("can the person see colors in chat? {}", .{chat_colors});
-                            const displayed_skin_parts = try readUnsignedByte(packet_reader); // Displayed Skin Parts
-                            log.info("displayed_skin_parts: {}", .{displayed_skin_parts});
-
-                            return .keep;
-                        },
-                        0x17 => { // Plugin Message
-                            var buf: [1024]u8 = undefined; // not sure about this buf size
-                            var counting_packet_reader = io.countingReader(packet_reader);
-                            const channel = try readString(counting_packet_reader.reader(), &buf); // Channel
-                            log.info("Plugin Message channel: {s}", .{channel});
-                            log.warn("ignoring Plugin Message content. also see length above", .{});
-                            // we still need to look at all bytes of this Byte Array before we can continue.
-                            // this is not very elegant.
-                            var packet_id_bytes = std.BoundedArray(u8, 5){};
-                            try writeVarInt(packet_id_bytes.writer(), packet_id);
-                            try packet_reader.skipBytes(
-                                ((math.cast(u64, length) orelse return error.NegativePacketLength) - counting_packet_reader.bytes_read - packet_id_bytes.len),
-                                .{},
-                            ); // Data
-
-                            return .keep;
-                        },
-                        else => return error.UnexpectedPlayPacketID,
-                    }
-                },
+                else => return error.UnexpectedPlayPacketID,
             }
         }
 
