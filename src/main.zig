@@ -17,6 +17,7 @@ const json = std.json;
 const compress = std.compress;
 const mem = std.mem;
 const io = std.io;
+const time = std.time;
 
 /// https://wiki.vg/Protocol_version_numbers
 const ProtocolVersion = enum(i32) {
@@ -66,6 +67,9 @@ const Server = struct {
         state: State = .handshake,
         packet_buffer: std.ArrayListUnmanaged(u8) = .{},
         protocol_version: ProtocolVersion = undefined,
+        keep_alive_send_timer: time.Timer,
+        keep_alive_receive_timer: time.Timer,
+        keep_alive_id: i32 = 0, //std.math.minInt(i32),
 
         const State = enum(u2) {
             /// https://wiki.vg/Protocol#Handshake
@@ -80,13 +84,39 @@ const Server = struct {
 
         const KeepOrTerminate = enum { keep, terminate };
 
+        fn init(stream: net.Stream) !Client {
+            return .{
+                .stream = stream,
+                // we should perhaps move this into a play() and then start these timers.
+                .keep_alive_send_timer = time.Timer.start() catch {
+                    // this can be made more user-friendly
+                    @panic("unsupported environment");
+                },
+                .keep_alive_receive_timer = time.Timer.start() catch {
+                    // this can be made more user-friendly
+                    @panic("unsupported environment");
+                },
+            };
+        }
+
         fn handle(client: *Client, allocator: mem.Allocator) void {
             while (true) {
-                const status = client.receivePacket(allocator) catch |err| {
+                var keep_or_terminate = client.receivePacket(allocator) catch |err| {
                     log.err("handling packet: {}", .{err});
-                    break;
+                    continue;
                 };
-                switch (status) {
+                switch (keep_or_terminate) {
+                    .keep => {},
+                    .terminate => {
+                        client.stream.close();
+                        break;
+                    },
+                }
+                keep_or_terminate = client.handleKeepAlive(allocator) catch |err| {
+                    log.err("sending Keep Alive: {}", .{err});
+                    continue;
+                };
+                switch (keep_or_terminate) {
                     .keep => {},
                     .terminate => {
                         client.stream.close();
@@ -94,6 +124,32 @@ const Server = struct {
                     },
                 }
             }
+        }
+
+        fn handleKeepAlive(client: *Client, allocator: mem.Allocator) !KeepOrTerminate {
+            if (client.state != .play) return .keep;
+
+            // this timer should perhaps be started only after the first keep alive is sent. use null.
+            if (client.keep_alive_receive_timer.read() > 30 * time.ns_per_s) {
+                log.warn("kicking client. for example their internet connection might've died", .{});
+                return .terminate;
+            }
+
+            // If the server does not send any keep-alives for 20 seconds, the client will disconnect and yields a "Timed out" exception.
+            if (client.keep_alive_send_timer.read() >= 10 * time.ns_per_s) {
+                defer client.keep_alive_send_timer.reset();
+                // We should figure out what is preventing us here from just sending 0 as the Keep Alive ID every time.
+                // and what's the benefit of sending the millisecond timestamp instead of just incrementing an ID every time?
+                // What's the best kind of ID to send?
+                //const keep_alive_id = @truncate(i32, try math.absInt(time.milliTimestamp()));
+                log.info("sending Keep Alive with ID {d}", .{client.keep_alive_id});
+                const packet_writer = client.packet_buffer.writer(allocator);
+                try writeVarInt(packet_writer, client.keep_alive_id); // Keep Alive ID
+                client.keep_alive_id +%= 1;
+                try client.sendPacket(0x00);
+            }
+
+            return .keep;
         }
 
         fn receivePacket(client: *Client, allocator: mem.Allocator) !KeepOrTerminate {
@@ -104,7 +160,13 @@ const Server = struct {
 
             std.debug.print("\n", .{});
             log.debug("receiving packet...", .{});
-            const length = try readVarInt(packet_reader); // Length
+            const length = readVarInt(packet_reader) catch |err| {
+                if (err == error.EndOfStream) {
+                    // The player probably disconnected.
+                    return .terminate;
+                }
+                return err;
+            }; // Length
             if (length == 0xfe) { // Legacy Server List Ping
                 // Only clients before 1.7.0 send this.
                 log.info("legacy packet received", .{});
@@ -116,7 +178,7 @@ const Server = struct {
             if (length > std.math.maxInt(u21)) return error.PacketTooBig;
 
             const packet_id = try readVarInt(packet_reader); // Packet ID
-            log.debug("Packet ID: 0x{X}", .{packet_id});
+            log.debug("Packet ID: 0x{x:0>2}", .{math.cast(u31, packet_id) orelse return error.InvalidPacketID});
 
             switch (client.state) {
                 .play => return client.handlePlay(allocator, packet_id, length),
@@ -259,6 +321,69 @@ const Server = struct {
             const packet_writer = client.packet_buffer.writer(allocator);
             _ = packet_writer;
             switch (packet_id) {
+                0x00 => { // Keep Alive
+                    const keep_alive_id = try readVarInt(packet_reader); // Keep Alive ID
+                    log.info("received Keep Alive with ID {d}", .{keep_alive_id});
+
+                    if (keep_alive_id != client.keep_alive_id - 1)
+                        log.warn("the received Keep Alive ID is probably not the one we sent", .{});
+
+                    client.keep_alive_receive_timer.reset();
+
+                    return .keep;
+                },
+                0x03 => { // Player
+                    log.info("received Player", .{});
+
+                    const on_ground = try readBoolean(packet_reader); // On Ground
+                    log.info("player On Ground: {}", .{on_ground});
+
+                    return .keep;
+                },
+                0x04 => { // Player Position
+                    log.info("received Player Position", .{});
+
+                    const x = try readDouble(packet_reader); // X
+                    log.info("player X: {d}", .{x});
+                    const feet_y = try readDouble(packet_reader); // Feet Y
+                    log.info("player Feet Y: {d}", .{feet_y});
+                    const z = try readDouble(packet_reader); // Z
+                    log.info("player Z: {d}", .{z});
+                    const on_ground = try readBoolean(packet_reader); // On Ground
+                    log.info("player On Ground: {}", .{on_ground});
+
+                    return .keep;
+                },
+                0x05 => { // Player Look
+                    log.info("received Player Look", .{});
+
+                    const yaw = try readFloat(packet_reader); // Yaw
+                    log.info("player Yaw: {d}", .{yaw});
+                    const pitch = try readFloat(packet_reader); // Pitch
+                    log.info("player Pitch: {d}", .{pitch});
+                    const on_ground = try readBoolean(packet_reader); // On Ground
+                    log.info("player On Ground: {}", .{on_ground});
+
+                    return .keep;
+                },
+                0x06 => { // Player Position And Look
+                    log.info("received Player Position And Look", .{});
+
+                    const x = try readDouble(packet_reader); // X
+                    log.info("player X: {d}", .{x});
+                    const feet_y = try readDouble(packet_reader); // Feet Y
+                    log.info("player Feet Y: {d}", .{feet_y});
+                    const z = try readDouble(packet_reader); // Z
+                    log.info("player Z: {d}", .{z});
+                    const yaw = try readFloat(packet_reader); // Yaw
+                    log.info("player Yaw: {d}", .{yaw});
+                    const pitch = try readFloat(packet_reader); // Pitch
+                    log.info("player Pitch: {d}", .{pitch});
+                    const on_ground = try readBoolean(packet_reader); // On Ground
+                    log.info("player On Ground: {}", .{on_ground});
+
+                    return .keep;
+                },
                 0x15 => { // Client Settings
                     var buf: [16]u8 = undefined;
                     const locale = try readString(packet_reader, &buf); // Locale
@@ -284,10 +409,8 @@ const Server = struct {
                     // this is not very elegant.
                     var packet_id_bytes = std.BoundedArray(u8, 5){};
                     try writeVarInt(packet_id_bytes.writer(), packet_id);
-                    try packet_reader.skipBytes(
-                        ((math.cast(u64, packet_length) orelse return error.NegativePacketLength) - counting_packet_reader.bytes_read - packet_id_bytes.len),
-                        .{},
-                    ); // Data
+                    const data_length = ((math.cast(u64, packet_length) orelse return error.NegativePacketLength) - counting_packet_reader.bytes_read - packet_id_bytes.len);
+                    try packet_reader.skipBytes(data_length, .{}); // Data
 
                     return .keep;
                 },
@@ -320,13 +443,14 @@ const Server = struct {
         try tcp_server.listen(address);
         log.info("listening on {}", .{address});
         while (true) {
-            // `accept` is thread-safe and accepting clients can be parallelized
+            // `accept` is thread-safe and accepting clients can be parallelized.
+            // and we should pair that with async/await to process another client while waiting for something in a different client.
             const connection = tcp_server.accept() catch |err| {
                 log.err("accepting connection: {}", .{err});
                 continue;
             };
             log.info("new client: {}", .{connection});
-            var client = Client{ .stream = connection.stream };
+            var client = try Client.init(connection.stream);
             client.handle(allocator);
         }
     }
@@ -378,10 +502,16 @@ fn writeLong(writer: anytype, value: i64) !void {
     try writer.writeIntBig(i64, value);
 }
 
+fn readFloat(reader: anytype) !f32 {
+    return @bitCast(f32, try reader.readIntBig(u32));
+}
 fn writeFloat(writer: anytype, value: f32) !void {
     try writer.writeIntBig(u32, @bitCast(u32, value));
 }
 
+fn readDouble(reader: anytype) !f64 {
+    return @bitCast(f64, try reader.readIntBig(u64));
+}
 fn writeDouble(writer: anytype, value: f64) !void {
     try writer.writeIntBig(u64, @bitCast(u64, value));
 }
@@ -426,7 +556,7 @@ fn readVarInt(reader: anytype) !i32 {
 fn writeVarInt(writer: anytype, value: i32) !void {
     var value_unsigned = @bitCast(u32, value);
     while (true) {
-        if ((@intCast(i32, value_unsigned) & ~@as(i32, segment_bits)) == 0) {
+        if (value_unsigned & ~@as(u32, segment_bits) == 0) {
             try writer.writeByte(@intCast(u8, value_unsigned));
             break;
         }
@@ -449,7 +579,7 @@ fn readVarLong(reader: anytype) !i64 {
 fn writeVarLong(writer: anytype, value: i64) !void {
     var value_unsigned = @bitCast(u64, value);
     while (true) {
-        if ((@intCast(i64, value_unsigned) & ~@as(i64, segment_bits)) == 0) {
+        if (value_unsigned & ~@as(u64, segment_bits) == 0) {
             try writer.writeByte(@intCast(u8, value_unsigned));
             break;
         }
