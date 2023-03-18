@@ -31,7 +31,7 @@ var config: Config = x: {
     }
 };
 
-// for text, it'd be cool if color can be abstracted to work on the terminal as well as in the game using section signs
+// for text, it'd be cool if color can be abstracted to work on the terminal as well as in the game using section signs (ampersands are only used in MC Classic)
 
 const std = @import("std");
 
@@ -105,7 +105,6 @@ const Server = struct {
         protocol_version: ProtocolVersion = undefined,
         keep_alive_send_timer: time.Timer,
         keep_alive_receive_timer: time.Timer,
-        keep_alive_id: i32 = 0, //std.math.minInt(i32),
 
         const State = enum(u2) {
             /// https://wiki.vg/Protocol#Handshake
@@ -174,14 +173,11 @@ const Server = struct {
             // If the server does not send any keep-alives for 20 seconds, the client will disconnect and yields a "Timed out" exception.
             if (client.keep_alive_send_timer.read() >= 10 * time.ns_per_s) {
                 defer client.keep_alive_send_timer.reset();
-                // We should figure out what is preventing us here from just sending 0 as the Keep Alive ID every time.
-                // and what's the benefit of sending the millisecond timestamp instead of just incrementing an ID every time?
-                // What's the best kind of ID to send?
+                // It's ok to just use 0 as the Keep Alive ID every time but once we want to send Player List Item to the clients
+                // and supply a proper latency/ping value, we should use this to measure the latency and use a millisecond timestamp instead of 0.
                 //const keep_alive_id = @truncate(i32, try math.absInt(time.milliTimestamp()));
-                log.info("sending Keep Alive with ID {d}", .{client.keep_alive_id});
                 const packet_writer = client.packet_buffer.writer(allocator);
-                try writeVarInt(packet_writer, client.keep_alive_id); // Keep Alive ID
-                client.keep_alive_id +%= 1;
+                try writeVarInt(packet_writer, 0); // Keep Alive ID
                 try client.sendPacket(0x00);
             }
 
@@ -360,9 +356,6 @@ const Server = struct {
                 0x00 => { // Keep Alive
                     const keep_alive_id = try readVarInt(packet_reader); // Keep Alive ID
                     log.info("received Keep Alive with ID {d}", .{keep_alive_id});
-
-                    if (keep_alive_id != client.keep_alive_id - 1)
-                        log.warn("the received Keep Alive ID is probably not the one we sent", .{});
 
                     client.keep_alive_receive_timer.reset();
 
