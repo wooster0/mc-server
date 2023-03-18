@@ -1,8 +1,37 @@
-// parse/get the config using std.zig.Ast.parse("{}", .zon) or @import("cfg.zon") depending on a comptime flag on how the user wants to do it (perf vs ease of use) (and apply both to a common Config struct so code is the same for both)
-// or use JSON simply because MC uses it too and it's well known (in that case still do this; just parse JSON at comptime. @embedFile or read file depending on how the user wants it)
-// so, advanced users can boost the server performance by recompiling the server using *comptime-known config values*. this is a unique possibility offered only really by zig.
+// * instead of this, detect if config.json is in src/ (do this using build.zig. expose a package with a boolean for this?)
+// * eventually when Zig supports @import("foo.zon") maybe we can use ZON instead of JSON
+//   but for now (and maybe permanently) we'll use JSON simply because MC uses it too and it's well known and well understood
+/// This determines whether to configure the server at comptime (true) or at runtime (false).
+/// Either way configuration happens using a config.json file.
+/// Configuring the server at comptime means all runtime config checks would be optimized out, improving performance.
+/// Configuring at comptime is an option for advanced users willing to recompile the server. Requires the Zig compiler to be installed.
+const configure_at_compile_time = true; // this should be false in production. users should make this true by themselves.
 
-// for text, it'd be cool if color can be abstracted to work on the terminal as well as in the game using ampersands and or section signs
+// The documentation of the fields in this struct is user-facing.
+// https://minecraft.fandom.com/wiki/Server.properties
+const Config = struct {
+    /// The maximum amount of players allowed on the server. Cannot be more than 4294967295.
+    /// The actual amount of players that the server can handle is only restricted by your hardware that the server is running on.
+    max_players: u32,
+    ///// true = Measure the latency for every player and update the bars icon in the player list accordingly (slower).
+    ///// false = Use the 5 bars icon for all players (faster).
+    //player_list_update_bars: bool,
+};
+
+var config: Config = x: {
+    if (configure_at_compile_time) {
+        const payload = @embedFile("config.json");
+        var stream = json.TokenStream.init(payload);
+        const res = json.parse(Config, &stream, .{});
+        // Assert no error can occur since we are
+        // parsing this JSON at comptime!
+        break :x res catch unreachable;
+    } else {
+        break :x undefined;
+    }
+};
+
+// for text, it'd be cool if color can be abstracted to work on the terminal as well as in the game using section signs
 
 const std = @import("std");
 
@@ -46,9 +75,16 @@ const Status = struct {
 };
 
 pub fn main() !void {
-    var allocator = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+    if (!configure_at_compile_time) {
+        const payload = try std.fs.cwd().readFileAlloc(gpa.allocator(), "config.json", std.math.maxInt(usize));
+        var stream = json.TokenStream.init(payload);
+        config = try json.parse(Config, &stream, .{});
+    }
+
     var server = Server{};
-    try server.run(allocator.allocator());
+    try server.run(gpa.allocator());
 }
 
 threadlocal var json_buffer = std.BoundedArray(u8, 2048){};
