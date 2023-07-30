@@ -62,7 +62,7 @@ const ProtocolVersion = enum(i32) {
         out_stream: anytype,
     ) !void {
         _ = options;
-        try out_stream.print("{d}", .{@enumToInt(value)});
+        try out_stream.print("{d}", .{@intFromEnum(value)});
     }
 };
 
@@ -226,7 +226,7 @@ const Server = struct {
                 0x00 => { // Handshake
                     log.info("handling Handshake", .{});
 
-                    const protocol_version = @intToEnum(ProtocolVersion, try readVarInt(packet_reader)); // Protocol Version
+                    const protocol_version = @as(ProtocolVersion, @enumFromInt(try readVarInt(packet_reader))); // Protocol Version
                     client.protocol_version = protocol_version;
                     log.debug("protocol_version: {}", .{protocol_version});
 
@@ -452,7 +452,7 @@ const Server = struct {
             var id_bytes = std.BoundedArray(u8, 5){};
             try writeVarInt(id_bytes.writer(), id);
             const stream_writer = client.stream.writer();
-            try writeVarInt(stream_writer, @intCast(i32, id_bytes.len + client.packet_buffer.items.len)); // Length of Packet ID + Data
+            try writeVarInt(stream_writer, @as(i32, @intCast(id_bytes.len + client.packet_buffer.items.len))); // Length of Packet ID + Data
             try stream_writer.writeAll(id_bytes.constSlice()); // Packet ID
             try stream_writer.writeAll(client.packet_buffer.items); // Data (they call this a Byte Array)
             client.packet_buffer.items.len = 0;
@@ -498,15 +498,15 @@ fn readBoolean(reader: anytype) !bool {
     };
 }
 fn writeBoolean(writer: anytype, value: bool) !void {
-    try writer.writeByte(@boolToInt(value));
+    try writer.writeByte(@intFromBool(value));
 }
 
 // there is readByteSigned in the std but not writeByteSigned...
 fn readByte(reader: anytype) !i8 {
-    return @bitCast(i8, try reader.readByte());
+    return @as(i8, @bitCast(try reader.readByte()));
 }
 fn writeByte(writer: anytype, value: i8) !void {
-    try writer.writeByte(@bitCast(u8, value));
+    try writer.writeByte(@as(u8, @bitCast(value)));
 }
 
 fn readUnsignedByte(reader: anytype) !u8 {
@@ -532,17 +532,17 @@ fn writeLong(writer: anytype, value: i64) !void {
 }
 
 fn readFloat(reader: anytype) !f32 {
-    return @bitCast(f32, try reader.readIntBig(u32));
+    return @as(f32, @bitCast(try reader.readIntBig(u32)));
 }
 fn writeFloat(writer: anytype, value: f32) !void {
-    try writer.writeIntBig(u32, @bitCast(u32, value));
+    try writer.writeIntBig(u32, @as(u32, @bitCast(value)));
 }
 
 fn readDouble(reader: anytype) !f64 {
-    return @bitCast(f64, try reader.readIntBig(u64));
+    return @as(f64, @bitCast(try reader.readIntBig(u64)));
 }
 fn writeDouble(writer: anytype, value: f64) !void {
-    try writer.writeIntBig(u64, @bitCast(u64, value));
+    try writer.writeIntBig(u64, @as(u64, @bitCast(value)));
 }
 
 fn readString(reader: anytype, buf: []u8) ![]const u8 {
@@ -554,7 +554,7 @@ fn readString(reader: anytype, buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 fn writeString(writer: anytype, buf: []const u8) !void {
-    try writeVarInt(writer, @intCast(u15, buf.len)); // Maximum length is 32767.
+    try writeVarInt(writer, @as(u15, @intCast(buf.len))); // Maximum length is 32767.
     try writer.writeAll(buf);
 }
 
@@ -576,20 +576,20 @@ fn readVarInt(reader: anytype) !i32 {
     var position: u5 = 0;
     while (true) {
         const byte = try reader.readByte();
-        value |= (@intCast(i32, byte) & segment_bits) << position;
+        value |= (@as(i32, @intCast(byte)) & segment_bits) << position;
         if ((byte & continue_bit) == 0) break;
         position = math.add(u5, position, 7) catch return error.VarIntTooBig;
     }
     return value;
 }
 fn writeVarInt(writer: anytype, value: i32) !void {
-    var value_unsigned = @bitCast(u32, value);
+    var value_unsigned = @as(u32, @bitCast(value));
     while (true) {
         if (value_unsigned & ~@as(u32, segment_bits) == 0) {
-            try writer.writeByte(@intCast(u8, value_unsigned));
+            try writer.writeByte(@as(u8, @intCast(value_unsigned)));
             break;
         }
-        try writer.writeByte(@intCast(u8, (value_unsigned & segment_bits) | continue_bit));
+        try writer.writeByte(@as(u8, @intCast((value_unsigned & segment_bits) | continue_bit)));
         value_unsigned >>= 7;
     }
 }
@@ -599,20 +599,20 @@ fn readVarLong(reader: anytype) !i64 {
     var position: u6 = 0;
     while (true) {
         const byte = try reader.readByte();
-        value |= (@intCast(i64, byte) & segment_bits) << position;
+        value |= (@as(i64, @intCast(byte)) & segment_bits) << position;
         if ((byte & continue_bit) == 0) break;
         position = math.add(u6, position, 7) catch return error.VarLongTooBig;
     }
     return value;
 }
 fn writeVarLong(writer: anytype, value: i64) !void {
-    var value_unsigned = @bitCast(u64, value);
+    var value_unsigned = @as(u64, @bitCast(value));
     while (true) {
         if (value_unsigned & ~@as(u64, segment_bits) == 0) {
-            try writer.writeByte(@intCast(u8, value_unsigned));
+            try writer.writeByte(@as(u8, @intCast(value_unsigned)));
             break;
         }
-        try writer.writeByte(@intCast(u8, (value_unsigned & segment_bits) | continue_bit));
+        try writer.writeByte(@as(u8, @intCast((value_unsigned & segment_bits) | continue_bit)));
         value_unsigned >>= 7;
     }
 }
